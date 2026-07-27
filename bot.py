@@ -32,8 +32,12 @@ from database import (
     list_recurring_rules,
     get_due_recurring_rules,
     advance_recurring_rule,
+    update_recurring_rule,
+    delete_recurring_rule,
+    get_recurring_rule_by_id,
+    get_month_recurring_rules,
 )
-from categorizer import detect_category, all_categories
+from categorizer import detect_category, all_categories, normalize_category
 from parser import parse_transaction, parse_transactions
 from voice import transcribe_voice
 from report import build_text_report, build_chart, export_month_excel
@@ -60,10 +64,13 @@ HELP_TEXT = (
     "/setlimit \"Транспорт\" 15000 — задать лимит категории\n"
     "/limits — показать активные лимиты и текущий прогресс\n"
     "/removelimit \"Транспорт\" — удалить лимит категории\n"
-    "/clearall — удалить все записи, лимиты и повторяющиеся правила\n"
     "/history — история за текущий месяц\n"
     "/history 2026-07 — история за конкретный месяц\n"
     "/recurring add 5000 аренда Дом и коммуналка — добавить повторяющуюся запись\n"
+    "/recurring list — список повторяющихся записей\n"
+    "/recurring edit <id> <сумма> [категория] — редактировать повторяющуюся запись\n"
+    "/recurring remove <id> — удалить повторяющуюся запись\n"
+    "/clearall — удалить все записи, лимиты и повторяющиеся правила\n"
 )
 
 
@@ -146,7 +153,18 @@ async def cmd_setlimit(message: Message) -> None:
         await message.answer("Формат: /setlimit \"Транспорт\" 15000")
         return
 
-    category = parts[1].strip().strip('"')
+    category_input = parts[1].strip().strip('"')
+    category = normalize_category(category_input)
+    
+    if category is None:
+        cats = ", ".join(all_categories()[:5])
+        await message.answer(
+            f"❌ Категория '{category_input}' не найдена.\n\n"
+            f"Доступные категории: {cats} и другие.\n"
+            f"Используйте /categories для полного списка."
+        )
+        return
+    
     try:
         amount = float(parts[2])
     except ValueError:
@@ -186,7 +204,13 @@ async def cmd_removelimit(message: Message) -> None:
         await message.answer("Формат: /removelimit \"Транспорт\"")
         return
 
-    category = parts[1].strip().strip('"')
+    category_input = parts[1].strip().strip('"')
+    category = normalize_category(category_input)
+    
+    if category is None:
+        await message.answer(f"❌ Категория '{category_input}' не найдена.")
+        return
+    
     removed = await remove_category_limit(message.from_user.id, category)
     if removed:
         await message.answer(f"Лимит для категории {category} удалён.")
@@ -234,6 +258,8 @@ async def cmd_history(message: Message) -> None:
 @dp.message(Command("recurring"))
 async def cmd_recurring(message: Message) -> None:
     parts = message.text.split(maxsplit=4)
+    
+    # /recurring add 5000 аренда Дом и коммуналка
     if len(parts) >= 5 and parts[1] == "add":
         try:
             amount = float(parts[2])
@@ -243,9 +269,58 @@ async def cmd_recurring(message: Message) -> None:
             await message.answer("Формат: /recurring add 5000 аренда Дом и коммуналка")
             return
         rule_id = await add_recurring_rule(message.from_user.id, description, amount, category)
-        await message.answer(f"Добавлено правило #{rule_id}: {description} — {amount:,.0f} тг".replace(",", " "))
+        await message.answer(f"Добавлено правило #{rule_id}: {description} — {amount:,.0f} тг в категории {category}".replace(",", " "))
         return
-
+    
+    # /recurring edit <id> <amount> [category]
+    if len(parts) >= 3 and parts[1] == "edit":
+        try:
+            rule_id = int(parts[2])
+            amount = float(parts[3]) if len(parts) > 3 else None
+            category = " ".join(parts[4:]) if len(parts) > 4 else None
+        except (ValueError, IndexError):
+            await message.answer("Формат: /recurring edit <id> <сумма> [категория]")
+            return
+        
+        rule = await get_recurring_rule_by_id(rule_id)
+        if rule is None:
+            await message.answer(f"Правило #{rule_id} не найдено.")
+            return
+        
+        if amount is None:
+            await message.answer("Нужно указать хотя бы сумму. Формат: /recurring edit <id> <сумма> [категория]")
+            return
+        
+        updated = await update_recurring_rule(rule_id, amount, category)
+        if updated:
+            new_amount = amount or rule[2]
+            new_category = category or rule[3]
+            await message.answer(f"✅ Правило #{rule_id} обновлено: {new_amount:,.0f} тг в категории {new_category}".replace(",", " "))
+        else:
+            await message.answer(f"Не удалось обновить правило #{rule_id}.")
+        return
+    
+    # /recurring remove <id>
+    if len(parts) >= 3 and parts[1] == "remove":
+        try:
+            rule_id = int(parts[2])
+        except ValueError:
+            await message.answer("Формат: /recurring remove <id>")
+            return
+        
+        rule = await get_recurring_rule_by_id(rule_id)
+        if rule is None:
+            await message.answer(f"Правило #{rule_id} не найдено.")
+            return
+        
+        deleted = await delete_recurring_rule(rule_id)
+        if deleted:
+            await message.answer(f"✅ Правило #{rule_id} ({rule[1]} — {rule[2]:,.0f} тг) удалено.".replace(",", " "))
+        else:
+            await message.answer(f"Не удалось удалить правило #{rule_id}.")
+        return
+    
+    # /recurring list (default)
     rules = await list_recurring_rules(message.from_user.id)
     if not rules:
         await message.answer("Пока нет повторяющихся правил.")
@@ -292,29 +367,56 @@ async def _process_transaction(message: Message, text: str) -> None:
         return
 
     now = datetime.now()
-    saved_messages = []
+    saved_entries = []
     for amount, description, transaction_type in parsed_items:
         category = detect_category(description, transaction_type)
         entry_id = await add_transaction(message.from_user.id, amount, category, description, transaction_type)
         await _maybe_warn_limit(message.from_user.id, category, amount, now.year, now.month)
 
         sign = "+" if transaction_type == "income" else "-"
-        saved_messages.append(
-            f"✅ {sign}{amount:,.0f} тг — {description}\nКатегория: {category}".replace(",", " ")
-        )
+        saved_entries.append({
+            "id": entry_id,
+            "amount": amount,
+            "description": description,
+            "category": category,
+            "sign": sign,
+        })
 
-        if len(parsed_items) == 1:
+    # Для одной записи показываем сразу кнопки с категориями
+    if len(saved_entries) == 1:
+        entry = saved_entries[0]
+        text_msg = f"✅ {entry['sign']}{entry['amount']:,.0f} тг — {entry['description']}\nКатегория: {entry['category']}".replace(",", " ")
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=cat, callback_data=f"category:{entry['id']}:{cat}") for cat in all_categories()[:4]],
+                [InlineKeyboardButton(text=cat, callback_data=f"category:{entry['id']}:{cat}") for cat in all_categories()[4:8]],
+                [InlineKeyboardButton(text=cat, callback_data=f"category:{entry['id']}:{cat}") for cat in all_categories()[8:]],
+            ]
+        )
+        await message.answer(text_msg, reply_markup=keyboard)
+    
+    # Для нескольких записей показываем список с кнопками для каждой
+    elif len(saved_entries) > 1:
+        text_msgs = []
+        for entry in saved_entries:
+            text_msgs.append(f"✅ {entry['sign']}{entry['amount']:,.0f} тг — {entry['description']} ({entry['category']})".replace(",", " "))
+        
+        await message.answer("\n".join(text_msgs))
+        await message.answer("Хотите отредактировать категории? Выберите запись:")
+        
+        # Показываем кнопки для выбора, какую запись редактировать
+        for entry in saved_entries:
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text=cat, callback_data=f"category:{entry_id}:{cat}") for cat in all_categories()[:4]],
-                    [InlineKeyboardButton(text=cat, callback_data=f"category:{entry_id}:{cat}") for cat in all_categories()[4:8]],
-                    [InlineKeyboardButton(text=cat, callback_data=f"category:{entry_id}:{cat}") for cat in all_categories()[8:]],
+                    [InlineKeyboardButton(text=cat, callback_data=f"category:{entry['id']}:{cat}") for cat in all_categories()[:4]],
+                    [InlineKeyboardButton(text=cat, callback_data=f"category:{entry['id']}:{cat}") for cat in all_categories()[4:8]],
+                    [InlineKeyboardButton(text=cat, callback_data=f"category:{entry['id']}:{cat}") for cat in all_categories()[8:]],
                 ]
             )
-            await message.answer(saved_messages[-1], reply_markup=keyboard)
-
-    if len(parsed_items) > 1:
-        await message.answer("\n\n".join(saved_messages))
+            await message.answer(
+                f"#{entry['id']}: {entry['description']} ({entry['category']})\nВыберите правильную категорию:",
+                reply_markup=keyboard
+            )
 
 
 @dp.callback_query(lambda callback: callback.data.startswith("category:"))

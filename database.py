@@ -259,3 +259,67 @@ async def advance_recurring_rule(rule_id: int) -> None:
             (next_due, datetime.now().isoformat(), rule_id),
         )
         await db.commit()
+
+
+async def update_recurring_rule(rule_id: int, amount: float | None = None, category: str | None = None) -> bool:
+    """Обновляет повторяющееся правило. Возвращает True если успешно."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if amount is not None and category is not None:
+            cursor = await db.execute(
+                "UPDATE recurring_rules SET amount = ?, category = ? WHERE id = ?",
+                (amount, category, rule_id),
+            )
+        elif amount is not None:
+            cursor = await db.execute(
+                "UPDATE recurring_rules SET amount = ? WHERE id = ?",
+                (amount, rule_id),
+            )
+        elif category is not None:
+            cursor = await db.execute(
+                "UPDATE recurring_rules SET category = ? WHERE id = ?",
+                (category, rule_id),
+            )
+        else:
+            return False
+        
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_recurring_rule(rule_id: int) -> bool:
+    """Удаляет повторяющееся правило. Возвращает True если успешно."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM recurring_rules WHERE id = ?",
+            (rule_id,),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_recurring_rule_by_id(rule_id: int) -> tuple | None:
+    """Получает повторяющееся правило по ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, description, amount, category, interval, next_due_date FROM recurring_rules WHERE id = ?",
+            (rule_id,),
+        )
+        return await cursor.fetchone()
+
+
+async def get_month_recurring_rules(user_id: int, year: int, month: int) -> list[tuple]:
+    """Получает повторяющиеся правила, которые должны быть активны в данном месяце."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Получаем правила, у которых next_due_date находится в этом месяце или раньше
+        start = date(year, month, 1).isoformat()
+        if month == 12:
+            end = date(year + 1, 1, 1).isoformat()
+        else:
+            end = date(year, month + 1, 1).isoformat()
+        
+        cursor = await db.execute(
+            "SELECT id, description, amount, category, interval, next_due_date FROM recurring_rules "
+            "WHERE user_id = ? AND next_due_date < ? ORDER BY next_due_date",
+            (user_id, end),
+        )
+        return await cursor.fetchall()

@@ -8,7 +8,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from openpyxl import Workbook
 
-from database import get_category_totals, get_month_transactions
+from database import (
+    get_category_totals,
+    get_month_transactions,
+    get_month_recurring_rules,
+    list_category_limits,
+)
 
 MONTH_NAMES_RU = [
     "", "январь", "февраль", "март", "апрель", "май", "июнь",
@@ -19,14 +24,17 @@ MONTH_NAMES_RU = [
 async def build_text_report(user_id: int, year: int, month: int) -> str:
     totals = await get_category_totals(user_id, year, month)
     rows = await get_month_transactions(user_id, year, month)
+    recurring_rules = await get_month_recurring_rules(user_id, year, month)
+    limits = await list_category_limits(user_id, year, month)
 
-    if not rows:
+    if not rows and not recurring_rules:
         return f"За {MONTH_NAMES_RU[month]} {year} записей пока нет."
 
     income_total = sum(row[1] for row in rows if row[4] == "income")
     expense_total = sum(row[1] for row in rows if row[4] == "expense")
     balance = income_total - expense_total
     total_sum = sum(totals.values())
+    
     lines = [f"📊 Отчёт за {MONTH_NAMES_RU[month]} {year}", ""]
     lines.append(f"Доходы: {income_total:,.0f} тг".replace(",", " "))
     lines.append(f"Расходы: {expense_total:,.0f} тг".replace(",", " "))
@@ -38,6 +46,34 @@ async def build_text_report(user_id: int, year: int, month: int) -> str:
         for category, amount in sorted(totals.items(), key=lambda x: -x[1]):
             share = amount / total_sum * 100 if total_sum else 0
             lines.append(f"• {category}: {amount:,.0f} тг ({share:.0f}%)".replace(",", " "))
+
+    # Добавляем информацию о повторяющихся платежах
+    if recurring_rules:
+        lines.append("")
+        lines.append("Повторяющиеся платежи в этом месяце:")
+        recurring_total = 0
+        for rule_id, description, amount, category, interval, next_due_date in recurring_rules:
+            lines.append(f"• {description}: {amount:,.0f} тг ({category})".replace(",", " "))
+            recurring_total += amount
+        lines.append(f"Итого повторяющихся: {recurring_total:,.0f} тг".replace(",", " "))
+
+    # Добавляем информацию о лимитах
+    if limits:
+        lines.append("")
+        lines.append("📌 Статус лимитов:")
+        for category, limit_amount, current, remaining in limits:
+            if current >= limit_amount:
+                status = "🚨 превышен"
+                progress = "100%+"
+            elif current >= limit_amount * 0.8:
+                status = "⚠️ близко к лимиту"
+                progress = f"{current / limit_amount * 100:.0f}%"
+            else:
+                status = "✅ в норме"
+                progress = f"{current / limit_amount * 100:.0f}%"
+            lines.append(
+                f"• {category}: {current:,.0f}/{limit_amount:,.0f} тг ({progress}) — {status}".replace(",", " ")
+            )
 
     lines.append("")
     lines.append(f"Количество записей: {len(rows)}")
